@@ -1,7 +1,129 @@
+"""
+Unified Streamlit app for RAG Document Q&A.
+Merges backend logic directly so it runs as a single process
+on Streamlit Community Cloud (no FastAPI needed).
+"""
+
 import streamlit as st
-import requests
 import uuid
 import os
+import tempfile
+
+from dotenv import load_dotenv
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+
+load_dotenv()
+
+# ── Constants ──
+CHROMA_DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "uploaded_docs")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(CHROMA_DB_DIR, exist_ok=True)
+
+# ════════════════════════════════════════════
+# BACKEND LOGIC (inlined)
+# ════════════════════════════════════════════
+
+def get_embeddings():
+    return GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+
+def get_vectorstore():
+    return Chroma(
+        persist_directory=CHROMA_DB_DIR,
+        embedding_function=get_embeddings()
+    )
+
+def get_retriever():
+    return get_vectorstore().as_retriever(search_kwargs={"k": 4})
+
+def ingest_document(pdf_path: str):
+    """Extract text, chunk, embed, and store a PDF."""
+    loader = PyMuPDFLoader(pdf_path)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = splitter.split_documents(docs)
+    vectorstore = get_vectorstore()
+    vectorstore.add_documents(chunks)
+    return True
+
+def build_qa_chain(memory):
+    retriever = get_retriever()
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True
+    )
+    return chain
+
+def create_sample_pdf(pdf_path: str):
+    """Generates a sample PDF describing the system architecture using PyMuPDF."""
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+
+    page.insert_textbox(
+        fitz.Rect(50, 40, 545, 90),
+        "RAG DOCUMENT QA SYSTEM ARCHITECTURE",
+        fontsize=16,
+        fontname="hebo",
+        color=(0, 0.4, 0.8),
+        align=1
+    )
+
+    content = (
+        "This document serves as the target sample document to test the semantic search and "
+        "retrieval capabilities of the system. Recruiters can query this document to evaluate the RAG pipeline.\n\n"
+        "1. PROJECT SUMMARY & TECH STACK\n"
+        "This project is a high-performance Retrieval-Augmented Generation (RAG) web application built using:\n"
+        "- Streamlit: Clean, modern responsive user interface for interactive QA.\n"
+        "- FastAPI: High-performance, asynchronous REST backend.\n"
+        "- LangChain: Pipeline orchestration, memory buffers, and chain state.\n"
+        "- Chroma DB: Light, local vector database for embedding indexing.\n"
+        "- Google Gemini 2.5 Flash: State-of-the-art LLM for natural, accurate QA generation.\n"
+        "- PyMuPDF (fitz): Fast, reliable PDF text parsing.\n\n"
+        "2. DOCUMENT INGESTION WORKFLOW\n"
+        "When a document is uploaded, it is ingested through the following pipeline:\n"
+        "- Extraction: PyMuPDF parses the raw PDF content and metadata.\n"
+        "- Chunking: Text is split via LangChain's RecursiveCharacterTextSplitter.\n"
+        "- Chunk Size is configured to 500 characters.\n"
+        "- Chunk Overlap is configured to 50 characters to preserve context boundaries.\n"
+        "- Storage: Chunks are converted into 768-dimensional embeddings via Google Gemini's "
+        "'models/gemini-embedding-001' and stored directly in a Chroma vector collection.\n\n"
+        "3. RETRIEVAL & QUERY PIPELINE\n"
+        "When a user submits a chat query, the following steps occur:\n"
+        "- The query is vectorized using the Gemini embeddings model.\n"
+        "- Chroma DB calculates cosine similarities to fetch the top matching chunks.\n"
+        "- The LangChain ConversationalRetrievalChain synthesizes historical chat buffer "
+        "memory, retrieved document context, and the new query.\n"
+        "- The contextual prompt is sent to the Gemini 2.5 Flash model, which generates a coherent answer "
+        "along with exact page source references.\n\n"
+        "4. SYSTEM PERFORMANCE & LOGS\n"
+        "The retrieval pipeline has average latency under 1.5 seconds for semantic searches and "
+        "re-ranking. Custom memory key storage ensures distinct, independent conversation buffers "
+        "keyed by session UUIDs."
+    )
+
+    page.insert_textbox(
+        fitz.Rect(50, 100, 545, 800),
+        content,
+        fontsize=10.5,
+        fontname="helv",
+        align=0
+    )
+    doc.save(pdf_path)
+    doc.close()
+
+
+# ════════════════════════════════════════════
+# STREAMLIT FRONTEND
+# ════════════════════════════════════════════
 
 # ── Page Config ──
 st.set_page_config(
@@ -10,8 +132,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 # ── Custom CSS ──
 st.markdown("""
@@ -172,6 +292,12 @@ if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "memory" not in st.session_state:
+    st.session_state.memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer"
+    )
 
 # ════════════════════════════════════════════
 # SIDEBAR
@@ -195,15 +321,15 @@ with st.sidebar:
         if uploaded_files:
             with st.spinner("Parsing and embedding documents..."):
                 for uploaded_file in uploaded_files:
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+                    # Save to disk then ingest
+                    file_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getvalue())
                     try:
-                        response = requests.post(f"{API_URL}/upload", files=files)
-                        if response.status_code == 200:
-                            st.success(f"✅ {uploaded_file.name}")
-                        else:
-                            st.error(f"❌ {uploaded_file.name}: {response.text}")
+                        ingest_document(file_path)
+                        st.success(f"✅ {uploaded_file.name}")
                     except Exception as e:
-                        st.error(f"Connection error: {e}")
+                        st.error(f"❌ {uploaded_file.name}: {e}")
         else:
             st.warning("Please select at least one PDF file.")
 
@@ -215,13 +341,12 @@ with st.sidebar:
     if st.button("⚡ Load Sample Document", use_container_width=True):
         with st.spinner("Generating & indexing sample document..."):
             try:
-                response = requests.post(f"{API_URL}/load-demo")
-                if response.status_code == 200:
-                    st.success("Sample document loaded! Start asking questions.")
-                else:
-                    st.error(f"Failed: {response.text}")
+                demo_pdf_path = os.path.join(UPLOAD_DIR, "system_architecture_spec.pdf")
+                create_sample_pdf(demo_pdf_path)
+                ingest_document(demo_pdf_path)
+                st.success("Sample document loaded! Start asking questions.")
             except Exception as e:
-                st.error(f"Backend unavailable: {e}")
+                st.error(f"Failed: {e}")
 
     st.markdown('<hr class="soft-divider">', unsafe_allow_html=True)
 
@@ -250,11 +375,11 @@ with st.sidebar:
 
     st.markdown("""
     <div style="margin-top: 5px;">
-        <span class="tech-pill">FastAPI</span>
         <span class="tech-pill">Streamlit</span>
         <span class="tech-pill">LangChain</span>
+        <span class="tech-pill">ChromaDB</span>
         <span class="tech-pill">PyMuPDF</span>
-        <span class="tech-pill">Docker</span>
+        <span class="tech-pill">Gemini</span>
     </div>
     """, unsafe_allow_html=True)
 
@@ -311,35 +436,34 @@ with tab_chat:
         with st.chat_message("assistant"):
             with st.spinner("Searching documents & generating answer..."):
                 try:
-                    response = requests.post(
-                        f"{API_URL}/ask",
-                        json={"question": prompt, "session_id": st.session_state.session_id}
-                    )
+                    chain = build_qa_chain(st.session_state.memory)
+                    result = chain.invoke({"question": prompt})
 
-                    if response.status_code == 200:
-                        data = response.json()
-                        answer = data["answer"]
-                        sources = data.get("sources", [])
-
-                        st.markdown(answer)
-
-                        if sources:
-                            citations = ""
-                            for src in sources:
-                                name = os.path.basename(src["source"])
-                                page = src["page"] + 1 if src["page"] >= 0 else "?"
-                                citations += f'<span class="cite-tag">📖 {name} — Page {page}</span>'
-                            st.markdown(citations, unsafe_allow_html=True)
-
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": answer,
-                            "sources": sources
+                    answer = result["answer"]
+                    sources = []
+                    for doc in result.get("source_documents", []):
+                        sources.append({
+                            "source": doc.metadata.get("source", "Unknown"),
+                            "page": doc.metadata.get("page", -1)
                         })
-                    else:
-                        st.error(f"Error: {response.text}")
+
+                    st.markdown(answer)
+
+                    if sources:
+                        citations = ""
+                        for src in sources:
+                            name = os.path.basename(src["source"])
+                            page = src["page"] + 1 if src["page"] >= 0 else "?"
+                            citations += f'<span class="cite-tag">📖 {name} — Page {page}</span>'
+                        st.markdown(citations, unsafe_allow_html=True)
+
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": sources
+                    })
                 except Exception as e:
-                    st.error(f"Could not reach backend: {e}")
+                    st.error(f"Error: {e}")
 
 # ── Tab 2: Architecture ──
 with tab_arch:

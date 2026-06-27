@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+__pycache__
+*.pyc
+*.pyo
+chroma_db/
+data/uploaded_docs/*
+*.log
+venv/
+.venv/
+README.md
+.gemini/

@@ -2,7 +2,8 @@
 .env
 
 # Vector databases / ChromaDB
-chroma_db/
+chroma_db/*
+!chroma_db/.gitkeep
 chroma_db_test/
 
 # Python Cache
